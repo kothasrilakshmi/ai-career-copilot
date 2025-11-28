@@ -1,6 +1,7 @@
 from dotenv import load_dotenv
 import os
 import re
+import json
 from pypdf import PdfReader
 import streamlit as st
 from openai import OpenAI
@@ -24,6 +25,62 @@ def extract_pdf_text(file) -> str:
         return "\n".join(chunks)
     except Exception as e:
         raise RuntimeError(f"Could not read PDF: {e}")
+    
+
+def validate_job_description_gpt(jd_text: str) -> tuple[bool, str]:
+    """
+    Uses GPT to decide if jd_text is a real job description.
+    Returns (is_valid, explanation).
+    """
+
+    # Optional: cheap local filter before calling GPT (saves tokens)
+    if len(jd_text.split()) < 40:
+        return False, "The text is very short. A job description is usually at least a few sentences."
+
+    system_msg = (
+        "You are an experienced recruiter. "
+        "Given some text, decide if it is a REAL job description for a role "
+        "(e.g., Data Scientist, Software Engineer, Product Manager) "
+        "or if it is something else (code, personal note, essay, random text, etc.). "
+        "Be strict: if it does not clearly look like a job posting, mark it as invalid."
+    )
+
+    user_msg = f"""
+Text:
+\"\"\"{jd_text.strip()}\"\"\"
+
+Your task:
+
+1. Decide if this is a valid job description.
+2. Valid job description = describes a role, responsibilities, skills/experience, and/or requirements.
+3. If not valid, briefly explain why.
+
+Respond ONLY as JSON in this format:
+
+{{
+  "is_valid": true or false,
+  "reason": "short explanation in one sentence"
+}}
+"""
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+    )
+
+    try:
+        data = json.loads(resp.choices[0].message.content)
+        is_valid = bool(data.get("is_valid", False))
+        reason = data.get("reason", "")
+        return is_valid, reason
+    except Exception as e:
+        # If parsing fails, be conservative and treat as invalid
+        return False, f"Validation failed: {e}"
 
 def clean_text(t: str) -> str:
     """Light cleanup: collapse spaces, remove overly long runs, strip weird control chars."""
@@ -34,16 +91,46 @@ def clean_text(t: str) -> str:
     t = re.sub(r"\u200b|\ufeff", "", t)
     return t.strip()
 
+def jd_too_short(jd: str, min_words: int = 40) -> bool:
+    return len(jd.split()) < min_words
+
 def analyze_resume_with_ai(resume_text: str, job_description: str) -> str:
     """
     Calls the OpenAI Chat Completions API and returns a structured Markdown analysis.
     """
-    system = (
-        "You are a precise career advisor. Analyze a candidate's resume against a job description. "
-        "Be specific, concise, and actionable. Use clear section headers and bullet points. "
-        "Do not invent facts; use only provided text."
-    )
-    user = f"""
+
+    jd_words = len(job_description.split())
+
+    if jd_words < 40:
+        # Fallback: resume-only feedback, no pretending there is a JD
+        system = (
+            "You are a precise career advisor. The user did NOT provide a real job "
+            "description (it is missing or too short). "
+            "Give feedback on the resume ALONE and explicitly say that you cannot "
+            "compare against a specific JD."
+        )
+        user = f"""
+Return your answer in **Markdown** with these sections:
+
+1) **Overall Resume Strengths** — 3–6 bullets
+2) **Areas to Improve** — 3–6 bullets
+3) **Resume Bullet Rewrites (ATS-ready)** — 3–6 bullets
+4) **General Professional Summary (3–4 sentences)**
+
+--- RESUME ---
+{resume_text}
+
+--- JOB DESCRIPTION (too short / invalid) ---
+{job_description}
+""".strip()
+    else:
+        # Normal comparison mode
+        system = (
+            "You are a precise career advisor. Analyze a candidate's resume against a job description. "
+            "Be specific, concise, and actionable. Use clear section headers and bullet points. "
+            "Do not invent facts; use only provided text."
+        )
+        user = f"""
 Return your answer in **Markdown** with these sections:
 
 1) **Strengths vs JD** — 3–6 bullets
@@ -68,6 +155,7 @@ Return your answer in **Markdown** with these sections:
         ],
     )
     return resp.choices[0].message.content.strip()
+
 
 # ---------------- UI ----------------
 
@@ -262,6 +350,19 @@ if st.button("Continue → Parse Resume"):
                 st.session_state["resume_text"] = text
                 st.session_state["job_description"] = job_description.strip()
 
+                is_valid_jd, jd_reason = validate_job_description_gpt(
+                    st.session_state["job_description"]
+                )
+                st.session_state["job_description_valid"] = is_valid_jd
+
+                if is_valid_jd:
+                    st.success("✅ Job description looks valid for analysis.")
+                else:
+                    st.error(
+                        "❌ This doesn’t look like a real job description.\n\n"
+                        f"Reason: {jd_reason}"
+                    )
+
             except Exception as e:
                 st.error(f"Resume parsing failed: {e}")
 
@@ -269,8 +370,10 @@ if st.button("Continue → Parse Resume"):
 st.markdown("---")
 st.markdown("### 🧠 Step 3 – Analyze with AI")
 
-ready = bool(st.session_state.get("resume_text")) and bool(
-    st.session_state.get("job_description")
+ready = (
+    bool(st.session_state.get("resume_text")) and
+    bool(st.session_state.get("job_description")) and
+    bool(st.session_state.get("job_description_valid"))
 )
 if not ready:
     st.caption(
@@ -278,12 +381,19 @@ if not ready:
     )
 
 if st.button("Analyze with AI", disabled=not ready):
-    with st.spinner("Analyzing resume vs job description…"):
-        try:
-            md = analyze_resume_with_ai(
-                st.session_state["resume_text"],
-                st.session_state["job_description"],
-            )
-            st.markdown(md)
-        except Exception as e:
-            st.error(f"OpenAI analysis failed: {e}")
+    jd = st.session_state["job_description"]
+    if jd_too_short(jd):
+        st.error(
+            "The job description is too short or not a real JD. "
+            "Please paste the full posting so I can compare your resume properly."
+        )
+    else:
+        with st.spinner("Analyzing resume vs job description…"):
+            try:
+                md = analyze_resume_with_ai(
+                    st.session_state["resume_text"],
+                    jd,
+                )
+                st.markdown(md)
+            except Exception as e:
+                st.error(f"OpenAI analysis failed: {e}")
